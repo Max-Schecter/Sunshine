@@ -1,0 +1,20 @@
+---
+name: Windows Test Build
+permissions: {}
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Windows
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci-windows.yml
+    with:
+      azure_signing_account: ''
+      azure_signing_cert_profile: ''
+      azure_signing_endpoint: ''
+      publish_release: 'false'
+      release_commit: ${{ github.sha }}
+      release_version: test-${{ github.run_number }}
