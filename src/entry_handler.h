@@ -54,6 +54,17 @@ namespace args {
    */
   int version();
 
+  /**
+   * @brief Submit a pairing PIN to a running Sunshine instance.
+   * @param name The name of the program.
+   * @param argc The number of arguments.
+   * @param argv The arguments.
+   * @examples
+   * pair("sunshine", 3, {"1234", "LivingRoomTV", "admin"});
+   * @examples_end
+   */
+  int pair(const char *name, int argc, char *argv[]);
+
 #ifdef _WIN32
   /**
    * @brief Restore global NVIDIA control panel settings.
