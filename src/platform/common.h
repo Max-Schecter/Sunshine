@@ -282,6 +282,7 @@ namespace platf {
 
     constexpr caps_t pen_touch = 0x01;  // Pen and touch events
     constexpr caps_t controller_touch = 0x02;  // Controller touch events
+    constexpr caps_t clipboard_sync = 0x04;  // Clipboard sync
   };  // namespace platform_caps
 
   struct gamepad_state_t {

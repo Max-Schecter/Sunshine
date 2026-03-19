@@ -14,6 +14,7 @@
 
 extern "C" {
   // clang-format off
+#include <moonlight-common-c/src/Input.h>
 #include <moonlight-common-c/src/Limelight-internal.h>
 #include "rswrapper.h"
   // clang-format on
@@ -33,6 +34,9 @@ extern "C" {
 #include "system_tray.h"
 #include "thread_safe.h"
 #include "utility.h"
+#ifdef _WIN32
+#include "platform/windows/clipboard.h"
+#endif
 
 constexpr int IDX_START_A = 0;
 constexpr int IDX_START_B = 1;
@@ -49,6 +53,7 @@ constexpr int IDX_RUMBLE_TRIGGER_DATA = 12;
 constexpr int IDX_SET_MOTION_EVENT = 13;
 constexpr int IDX_SET_RGB_LED = 14;
 constexpr int IDX_SET_ADAPTIVE_TRIGGERS = 15;
+constexpr int IDX_CLIPBOARD_TEXT = 16;
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -67,6 +72,7 @@ static const short packetTypes[] = {
   0x5501,  // Set motion event (Sunshine protocol extension)
   0x5502,  // Set RGB LED (Sunshine protocol extension)
   0x5503,  // Set Adaptive triggers (Sunshine protocol extension)
+  0x5504,  // Clipboard text (Sunshine protocol extension)
 };
 
 namespace asio = boost::asio;
@@ -210,6 +216,12 @@ namespace stream {
 
     // Sunshine protocol extension
     SS_HDR_METADATA metadata;
+  };
+
+  struct control_clipboard_text_t {
+    control_header_v2 header;
+    std::uint32_t generation;
+    std::uint32_t length;
   };
 
   typedef struct control_encrypted_t {
@@ -467,6 +479,41 @@ namespace stream {
     packet->seq = util::endian::little(seq);
 
     return std::string_view {(char *) tagged_cipher.data(), packet_length + sizeof(control_encrypted_t) - sizeof(control_encrypted_t::seq)};
+  }
+
+  static inline std::string_view encode_control(session_t *session, const std::string_view &plaintext, std::vector<std::uint8_t> &tagged_cipher) {
+    if (session->config.controlProtocolType != 13) {
+      return plaintext;
+    }
+
+    tagged_cipher.resize(sizeof(control_encrypted_t) + plaintext.size() + crypto::cipher::tag_size);
+    auto seq = session->control.seq++;
+
+    auto &iv = session->control.outgoing_iv;
+    if (session->config.encryptionFlagsEnabled & SS_ENC_CONTROL_V2) {
+      iv.resize(12);
+      std::copy_n((uint8_t *) &seq, sizeof(seq), std::begin(iv));
+      iv[10] = 'H';
+      iv[11] = 'C';
+    } else {
+      iv.resize(16);
+      iv[0] = (std::uint8_t) seq;
+    }
+
+    auto packet = (control_encrypted_p) tagged_cipher.data();
+    auto bytes = session->control.cipher.encrypt(plaintext, packet->payload(), &iv);
+    if (bytes <= 0) {
+      BOOST_LOG(error) << "Couldn't encrypt control data"sv;
+      return {};
+    }
+
+    std::uint16_t packet_length = bytes + crypto::cipher::tag_size + sizeof(control_encrypted_t::seq);
+    packet->encryptedHeaderType = util::endian::little(0x0001);
+    packet->length = util::endian::little(packet_length);
+    packet->seq = util::endian::little(seq);
+
+    auto total_length = packet_length + sizeof(control_encrypted_t) - sizeof(control_encrypted_t::seq);
+    return std::string_view {(char *) tagged_cipher.data(), total_length};
   }
 
   int start_broadcast(broadcast_ctx_t &ctx);
@@ -919,6 +966,48 @@ namespace stream {
     return 0;
   }
 
+#ifdef _WIN32
+  int send_clipboard_text(session_t *session, const platf::clipboard::update_t &update) {
+    if (!session->control.peer) {
+      return -1;
+    }
+
+    if (!(session->config.mlFeatureFlags & ML_FF_CLIPBOARD_SYNC)) {
+      return -1;
+    }
+
+    if (update.text.size() > platf::clipboard::max_clipboard_text_length) {
+      BOOST_LOG(debug) << "Dropping oversized host clipboard update"sv;
+      return -1;
+    }
+
+    std::vector<std::uint8_t> plaintext(sizeof(control_clipboard_text_t) + update.text.size());
+    auto *packet = (control_clipboard_text_t *) plaintext.data();
+    packet->header.type = packetTypes[IDX_CLIPBOARD_TEXT];
+    packet->header.payloadLength = sizeof(control_clipboard_text_t) - sizeof(control_header_v2) + (std::uint16_t) update.text.size();
+    packet->generation = util::endian::little(update.generation);
+    packet->length = util::endian::little((std::uint32_t) update.text.size());
+
+    if (!update.text.empty()) {
+      std::copy(update.text.begin(), update.text.end(), plaintext.begin() + sizeof(control_clipboard_text_t));
+    }
+
+    std::vector<std::uint8_t> encrypted_payload;
+    auto payload = encode_control(session, std::string_view {(char *) plaintext.data(), plaintext.size()}, encrypted_payload);
+    if (payload.empty()) {
+      return -1;
+    }
+
+    if (session->broadcast_ref->control_server.send(payload, session->control.peer)) {
+      TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
+      BOOST_LOG(warning) << "Couldn't send clipboard text to ["sv << addr << ':' << port << ']';
+      return -1;
+    }
+
+    return 0;
+  }
+#endif
+
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
@@ -1070,6 +1159,9 @@ namespace stream {
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
       bool has_session_awaiting_peer = false;
+#ifdef _WIN32
+      std::vector<session_t *> clipboard_sessions;
+#endif
 
       {
         auto lg = server->_sessions.lock();
@@ -1112,6 +1204,12 @@ namespace stream {
           if (!session->control.peer) {
             has_session_awaiting_peer = true;
           } else {
+#ifdef _WIN32
+            if (platf::clipboard::is_available() &&
+                (session->config.mlFeatureFlags & ML_FF_CLIPBOARD_SYNC)) {
+              clipboard_sessions.push_back(session);
+            }
+#endif
             auto &feedback_queue = session->control.feedback_queue;
             while (feedback_queue->peek()) {
               auto feedback_msg = feedback_queue->pop();
@@ -1130,6 +1228,17 @@ namespace stream {
           ++pos;
         })
       }
+
+#ifdef _WIN32
+      if (!clipboard_sessions.empty()) {
+        auto clipboard_update = platf::clipboard::consume_pending_local_update();
+        if (clipboard_update) {
+          for (auto *clipboard_session : clipboard_sessions) {
+            send_clipboard_text(clipboard_session, *clipboard_update);
+          }
+        }
+      }
+#endif
 
       // Don't break until any pending sessions either expire or connect
       if (proc::proc.running() == 0 && !has_session_awaiting_peer) {

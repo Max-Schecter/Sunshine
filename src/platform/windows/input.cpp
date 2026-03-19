@@ -16,6 +16,7 @@
 #include <ViGEm/Client.h>
 
 // local includes
+#include "clipboard.h"
 #include "keylayout.h"
 #include "misc.h"
 #include "src/config.h"
@@ -1766,6 +1767,10 @@ namespace platf {
       }
     } else {
       BOOST_LOG(warning) << "Touch input requires Windows 10 1809 or later"sv;
+    }
+
+    if (platf::clipboard::is_available()) {
+      caps |= platform_caps::clipboard_sync;
     }
 
     return caps;
