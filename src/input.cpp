@@ -25,6 +25,9 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "platform/common.h"
+#ifdef _WIN32
+#include "platform/windows/clipboard.h"
+#endif
 #include "thread_pool.h"
 #include "utility.h"
 
@@ -193,6 +196,14 @@ namespace input {
 
     int32_t accumulated_vscroll_delta;
     int32_t accumulated_hscroll_delta;
+
+    struct {
+      std::uint32_t generation;
+      std::uint16_t next_chunk;
+      std::uint16_t chunk_count;
+      std::uint32_t total_length;
+      std::string text;
+    } clipboard_sync;
   };
 
   /**
@@ -860,6 +871,67 @@ namespace input {
 
     int size = util::endian::big(packet->header.size) - sizeof(packet->header.magic);
     platf::unicode(platf_input, packet->text, size);
+  }
+
+  void passthrough(std::shared_ptr<input_t> &input, PSS_CLIPBOARD_TEXT_PACKET packet) {
+#ifdef _WIN32
+    auto chunk_index = util::endian::little(packet->chunkIndex);
+    auto chunk_count = util::endian::little(packet->chunkCount);
+    auto generation = util::endian::little(packet->generation);
+    auto total_length = util::endian::little(packet->totalLength);
+    int text_length = util::endian::big(packet->header.size) -
+                      (int)(sizeof(packet->header.magic) +
+                            sizeof(packet->generation) +
+                            sizeof(packet->chunkIndex) +
+                            sizeof(packet->chunkCount) +
+                            sizeof(packet->totalLength));
+
+    if (text_length < 0 || text_length > SS_CLIPBOARD_TEXT_MAX_BYTES || chunk_count == 0 || chunk_index >= chunk_count || total_length > platf::clipboard::max_clipboard_text_length) {
+      BOOST_LOG(debug) << "Dropping malformed clipboard sync packet"sv;
+      input->clipboard_sync = {};
+      return;
+    }
+
+    if (chunk_index == 0) {
+      input->clipboard_sync.generation = generation;
+      input->clipboard_sync.next_chunk = 0;
+      input->clipboard_sync.chunk_count = chunk_count;
+      input->clipboard_sync.total_length = total_length;
+      input->clipboard_sync.text.clear();
+      input->clipboard_sync.text.reserve(total_length);
+    }
+
+    if (input->clipboard_sync.generation != generation ||
+        input->clipboard_sync.chunk_count != chunk_count ||
+        input->clipboard_sync.next_chunk != chunk_index) {
+      BOOST_LOG(debug) << "Dropping out-of-order clipboard sync chunk"sv;
+      input->clipboard_sync = {};
+      return;
+    }
+
+    input->clipboard_sync.text.append(packet->text, text_length);
+    if (input->clipboard_sync.text.size() > input->clipboard_sync.total_length) {
+      BOOST_LOG(debug) << "Dropping oversized clipboard sync assembly"sv;
+      input->clipboard_sync = {};
+      return;
+    }
+
+    input->clipboard_sync.next_chunk++;
+
+    if (input->clipboard_sync.next_chunk == input->clipboard_sync.chunk_count) {
+      if (input->clipboard_sync.text.size() != input->clipboard_sync.total_length) {
+        BOOST_LOG(debug) << "Dropping incomplete clipboard sync assembly"sv;
+        input->clipboard_sync = {};
+        return;
+      }
+
+      platf::clipboard::enqueue_remote_update(std::move(input->clipboard_sync.text), generation);
+      input->clipboard_sync = {};
+    }
+#else
+    (void)input;
+    (void)packet;
+#endif
   }
 
   /**
@@ -1616,6 +1688,14 @@ namespace input {
         break;
       case SS_CONTROLLER_BATTERY_MAGIC:
         passthrough(input, (PSS_CONTROLLER_BATTERY_PACKET) payload);
+        break;
+      case SS_CLIPBOARD_TEXT_MAGIC:
+        passthrough(input, (PSS_CLIPBOARD_TEXT_PACKET) payload);
+        break;
+      default:
+        BOOST_LOG(debug) << "Ignoring unknown input magic [0x"sv
+                         << util::hex(util::endian::little(payload->magic)).to_string_view()
+                         << ']' ;
         break;
     }
   }

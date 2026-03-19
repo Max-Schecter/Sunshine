@@ -22,6 +22,9 @@
 #include "logging.h"
 #include "main.h"
 #include "nvhttp.h"
+#ifdef _WIN32
+#include "platform/windows/clipboard.h"
+#endif
 #include "process.h"
 #include "system_tray.h"
 #include "upnp.h"
@@ -68,6 +71,10 @@ std::map<std::string_view, std::function<int(const char *name, int argc, char **
 
 #ifdef _WIN32
 LRESULT CALLBACK SessionMonitorWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+  if (platf::clipboard::handle_window_message(hwnd, uMsg, wParam, lParam)) {
+    return 0;
+  }
+
   switch (uMsg) {
     case WM_CLOSE:
       DestroyWindow(hwnd);
@@ -268,6 +275,7 @@ int main(int argc, char *argv[]) {
       return;
     }
 
+    platf::clipboard::init(wnd);
     ShowWindow(wnd, SW_HIDE);
 
     // Run the message loop for our window
@@ -276,6 +284,8 @@ int main(int argc, char *argv[]) {
       TranslateMessage(&msg);
       DispatchMessage(&msg);
     }
+
+    platf::clipboard::deinit();
   });
 
   auto session_monitor_join_thread_guard = util::fail_guard([&]() {
