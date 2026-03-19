@@ -3,6 +3,10 @@ name: CI
 permissions: {}
 
 on:
+  pull_request:
+  push:
+    branches:
+      - master
   workflow_dispatch:
 
 concurrency:
