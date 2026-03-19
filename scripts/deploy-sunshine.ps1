@@ -111,7 +111,12 @@ function Find-Installer {
     Select-Object -First 1
   if ($anyExe) { return $anyExe.FullName }
 
-  throw "No EXE installer found in artifact contents."
+  $msi = Get-ChildItem -Path $SearchDir -Recurse -File -Filter "*.msi" |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+  if ($msi) { return $msi.FullName }
+
+  throw "No installer (.exe/.msi) found in artifact contents."
 }
 
 function Stop-SunshineService {
@@ -137,6 +142,15 @@ function Install-Sunshine {
   )
 
   $ext = [IO.Path]::GetExtension($InstallerPath).ToLowerInvariant()
+  if ($ext -eq ".msi") {
+    $args = "/i `"$InstallerPath`" /qn /norestart /l*v `"$LogPath`""
+    $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -NoNewWindow
+    if ($p.ExitCode -ne 0) {
+      throw "MSI install failed with exit code $($p.ExitCode)."
+    }
+    return
+  }
+
   if ($ext -eq ".exe") {
     $args = "/S"
     $p = Start-Process -FilePath $InstallerPath -ArgumentList $args -Wait -PassThru -NoNewWindow
@@ -146,7 +160,7 @@ function Install-Sunshine {
     return
   }
 
-  throw "Unsupported installer type (expected .exe): $InstallerPath"
+  throw "Unsupported installer type: $InstallerPath"
 }
 
 function Test-SunshineReady {
@@ -218,9 +232,6 @@ Assert-Admin
 
 if (-not (Test-Path $RollbackInstallerPath)) {
   throw "Rollback installer not found: $RollbackInstallerPath"
-}
-if ([IO.Path]::GetExtension($RollbackInstallerPath).ToLowerInvariant() -ne ".exe") {
-  throw "Rollback installer must be an EXE installer: $RollbackInstallerPath"
 }
 
 $headers = Get-GitHubHeaders -AuthToken $Token
