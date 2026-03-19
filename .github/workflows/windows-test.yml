@@ -39,7 +39,7 @@ jobs:
           msystem: ${{ env.MATRIX_MSYSTEM }}
           update: true
           install: >-
-            git
+            wget
 
       - name: Update Windows dependencies
         run: |
@@ -50,6 +50,7 @@ jobs:
             "mingw-w64-${TOOLCHAIN}-cppwinrt"
             "mingw-w64-${TOOLCHAIN}-curl-winssl"
             "mingw-w64-${TOOLCHAIN}-gcc"
+            "mingw-w64-${TOOLCHAIN}-graphviz"
             "mingw-w64-${TOOLCHAIN}-miniupnpc"
             "mingw-w64-${TOOLCHAIN}-MinHook"
             "mingw-w64-${TOOLCHAIN}-nlohmann-json"
@@ -61,6 +62,11 @@ jobs:
             "mingw-w64-${TOOLCHAIN}-toolchain"
           )
           pacman -Syu --noconfirm "${dependencies[@]}"
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7  # v5.2.0
+        with:
+          dotnet-version: '10.x'
 
       - name: Build Windows AMD64
         run: |
@@ -84,7 +90,11 @@ jobs:
           mkdir -p artifacts
           cd build
           cpack -G NSIS
+          cpack -G WIX
+          cpack -G ZIP
           mv ./cpack_artifacts/Sunshine.exe ../artifacts/Sunshine-Windows-AMD64-installer.exe
+          mv ./cpack_artifacts/Sunshine.msi ../artifacts/Sunshine-Windows-AMD64-installer.msi
+          mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine-Windows-AMD64-portable.zip
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
