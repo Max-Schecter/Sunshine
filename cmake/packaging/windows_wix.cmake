@@ -27,8 +27,9 @@ execute_process(
 )
 
 if(NOT WIX_INSTALL_RESULT EQUAL 0)
-    message(FATAL_ERROR "Failed to install WiX tools locally.
-     WiX packaging may not work correctly, error: ${WIX_INSTALL_OUTPUT}")
+    message(WARNING "Failed to install WiX tools locally.
+     Skipping WiX packaging, error: ${WIX_INSTALL_OUTPUT}")
+    return()
 endif()
 
 # Install WiX UI Extension

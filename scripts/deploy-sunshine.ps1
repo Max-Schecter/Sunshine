@@ -1,166 +1,148 @@
 param(
-  [Parameter(Mandatory = $true)]
-  [string]$Repo,
-
-  [Parameter(Mandatory = $true)]
-  [long]$RunId,
-
-  [Parameter(Mandatory = $true)]
-  [string]$ArtifactName,
-
-  [Parameter(Mandatory = $true)]
-  [string]$RollbackInstallerPath,
-
-  [string]$Token = $env:GITHUB_TOKEN,
+  [string]$RepoDir = "C:\dev\Sunshine",
+  [string]$Branch = "master",
   [string]$ServiceName = "SunshineService",
   [int]$HealthPort = 47990,
   [int]$StartupTimeoutSeconds = 60,
-  [string]$WorkRoot = "C:\ops\sunshine-deploy",
-  [string]$ConfigPath = "C:\Program Files\Sunshine\config"
+  [string]$RollbackInstaller = "C:\ops\sunshine-prev-installer.exe",
+  [string]$MsysRoot = "C:\msys64",
+  [int]$InstallerTimeoutSeconds = 180,
+  [string]$LogRoot = "C:\ops\logs"
 )
 
 $ErrorActionPreference = "Stop"
 
 function Assert-Admin {
-  $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
-    [Security.Principal.WindowsBuiltInRole]::Administrator
-  )
+  $principal = [Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
+  $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
   if (-not $isAdmin) {
     throw "This script must run in an elevated PowerShell session."
   }
 }
 
-function New-WorkDir {
-  param([string]$Root)
-  $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-  $path = Join-Path $Root $stamp
-  New-Item -ItemType Directory -Path $path -Force | Out-Null
-  return $path
-}
+function Assert-Command {
+  param([string]$Name)
 
-function Get-GitHubHeaders {
-  param([string]$AuthToken)
-  if ([string]::IsNullOrWhiteSpace($AuthToken)) {
-    throw "GitHub token missing. Set -Token or GITHUB_TOKEN."
-  }
-  return @{
-    Authorization          = "Bearer $AuthToken"
-    "X-GitHub-Api-Version" = "2022-11-28"
-    Accept                 = "application/vnd.github+json"
+  if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+    throw "Required command not found on PATH: $Name"
   }
 }
 
-function Get-ArtifactDownloadUrl {
-  param(
-    [string]$RepoName,
-    [long]$Run,
-    [string]$Name,
-    [hashtable]$Headers
+function Write-DeployLog {
+  param([string]$Message)
+
+  $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+  $line = "[$timestamp] $Message"
+  Write-Host $line
+  Add-Content -Path $script:DeployLogPath -Value $line
+}
+
+function Get-SunshineInstallVersion {
+  $paths = @(
+    "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Sunshine",
+    "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Sunshine"
   )
 
-  $url = "https://api.github.com/repos/$RepoName/actions/runs/$Run/artifacts?per_page=100"
-  $resp = Invoke-RestMethod -Method GET -Uri $url -Headers $Headers
-  if (-not $resp.artifacts) {
-    throw "No artifacts found for run id $Run in $RepoName."
+  foreach ($path in $paths) {
+    $item = Get-ItemProperty -Path $path -ErrorAction SilentlyContinue
+    if ($item -and $item.DisplayVersion) {
+      return [string]$item.DisplayVersion
+    }
   }
 
-  $artifact = $resp.artifacts |
-    Where-Object { $_.name -eq $Name -and $_.expired -eq $false } |
-    Select-Object -First 1
-
-  if (-not $artifact) {
-    throw "Artifact '$Name' not found (or expired) for run id $Run."
-  }
-
-  return $artifact.archive_download_url
+  return $null
 }
 
-function Assert-RunSucceeded {
+function Get-SunshineBinaryStamp {
+  $binaryPath = "C:\Program Files\Sunshine\sunshine.exe"
+  if (-not (Test-Path $binaryPath)) {
+    return $null
+  }
+
+  $item = Get-Item $binaryPath
+  return [string]::Format("{0}|{1}", $item.LastWriteTimeUtc.Ticks, $item.Length)
+}
+
+function Invoke-MsysBash {
   param(
-    [string]$RepoName,
-    [long]$Run,
-    [hashtable]$Headers
+    [string]$MsysPath,
+    [string]$Script
   )
 
-  $url = "https://api.github.com/repos/$RepoName/actions/runs/$Run"
-  $run = Invoke-RestMethod -Method GET -Uri $url -Headers $Headers
-  if ($run.status -ne "completed" -or $run.conclusion -ne "success") {
-    throw "Run $Run is not successful (status=$($run.status), conclusion=$($run.conclusion))."
+  $bashPath = Join-Path $MsysPath "usr\bin\bash.exe"
+  if (-not (Test-Path $bashPath)) {
+    throw "MSYS2 bash not found: $bashPath"
   }
-}
 
-function Download-ArtifactZip {
-  param(
-    [string]$DownloadUrl,
-    [string]$OutZip,
-    [hashtable]$Headers
-  )
-  Invoke-WebRequest -Method GET -Uri $DownloadUrl -Headers $Headers -OutFile $OutZip
-}
-
-function Find-Installer {
-  param([string]$SearchDir)
-
-  $preferredExe = Get-ChildItem -Path $SearchDir -Recurse -File -Filter "*installer.exe" |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
-  if ($preferredExe) { return $preferredExe.FullName }
-
-  $anyExe = Get-ChildItem -Path $SearchDir -Recurse -File -Filter "*.exe" |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
-  if ($anyExe) { return $anyExe.FullName }
-
-  $msi = Get-ChildItem -Path $SearchDir -Recurse -File -Filter "*.msi" |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
-  if ($msi) { return $msi.FullName }
-
-  throw "No installer (.exe/.msi) found in artifact contents."
+  & $bashPath -lc $Script
+  if ($LASTEXITCODE -ne 0) {
+    throw "MSYS2 command failed with exit code $LASTEXITCODE."
+  }
 }
 
 function Stop-SunshineService {
   param([string]$Name)
+
   $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
-  if ($svc) {
-    if ($svc.Status -ne "Stopped") {
-      Stop-Service -Name $Name -Force -ErrorAction Stop
-      $svc.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
-    }
+  if ($svc -and $svc.Status -ne "Stopped") {
+    Stop-Service -Name $Name -Force -ErrorAction Stop
+    $svc.WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
   }
 }
 
 function Start-SunshineService {
   param([string]$Name)
-  Start-Service -Name $Name -ErrorAction Stop
+
+  $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+  if (-not $svc) {
+    throw "Service not found: $Name"
+  }
+
+  if ($svc.Status -ne "Running") {
+    Start-Service -Name $Name -ErrorAction Stop
+  }
 }
 
 function Install-Sunshine {
   param(
     [string]$InstallerPath,
-    [string]$LogPath
+    [int]$TimeoutSeconds
   )
 
-  $ext = [IO.Path]::GetExtension($InstallerPath).ToLowerInvariant()
-  if ($ext -eq ".msi") {
-    $args = "/i `"$InstallerPath`" /qn /norestart /l*v `"$LogPath`""
-    $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -NoNewWindow
-    if ($p.ExitCode -ne 0) {
-      throw "MSI install failed with exit code $($p.ExitCode)."
+  if ([IO.Path]::GetExtension($InstallerPath).ToLowerInvariant() -ne ".exe") {
+    throw "Unsupported installer type (expected .exe): $InstallerPath"
+  }
+
+  $beforeVersion = Get-SunshineInstallVersion
+  $beforeBinaryStamp = Get-SunshineBinaryStamp
+  $process = Start-Process -FilePath $InstallerPath -ArgumentList "/S" -PassThru -NoNewWindow
+  if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+    try {
+      Stop-Process -Id $process.Id -Force -ErrorAction Stop
+    }
+    catch {
+      Write-DeployLog "Failed to stop timed out installer process $($process.Id): $($_.Exception.Message)"
+    }
+    throw "Installer timed out after ${TimeoutSeconds}s."
+  }
+
+  $afterVersion = Get-SunshineInstallVersion
+  $afterBinaryStamp = Get-SunshineBinaryStamp
+  $changed = $beforeVersion -ne $afterVersion -or $beforeBinaryStamp -ne $afterBinaryStamp
+
+  if ($null -ne $process.ExitCode) {
+    if ($process.ExitCode -ne 0 -and -not $changed) {
+      throw "Installer failed with exit code $($process.ExitCode)."
+    }
+    if ($process.ExitCode -ne 0 -and $changed) {
+      Write-DeployLog "Installer returned exit code $($process.ExitCode), but Sunshine install files changed. Continuing."
     }
     return
   }
 
-  if ($ext -eq ".exe") {
-    $args = "/S"
-    $p = Start-Process -FilePath $InstallerPath -ArgumentList $args -Wait -PassThru -NoNewWindow
-    if ($p.ExitCode -ne 0) {
-      throw "EXE install failed with exit code $($p.ExitCode)."
-    }
-    return
+  if (-not $changed) {
+    throw "Installer exited without an exit code and no Sunshine install changes were detected."
   }
-
-  throw "Unsupported installer type: $InstallerPath"
 }
 
 function Test-SunshineReady {
@@ -188,6 +170,7 @@ function Wait-SunshineReady {
     [int]$Port,
     [int]$TimeoutSec
   )
+
   $deadline = (Get-Date).AddSeconds($TimeoutSec)
   while ((Get-Date) -lt $deadline) {
     if (Test-SunshineReady -Name $Name -Port $Port) {
@@ -195,122 +178,126 @@ function Wait-SunshineReady {
     }
     Start-Sleep -Seconds 2
   }
+
   return $false
 }
 
-function Backup-Config {
-  param(
-    [string]$Path,
-    [string]$DestinationRoot
-  )
-  if (-not (Test-Path $Path)) {
-    return $null
-  }
-  $backupPath = Join-Path $DestinationRoot "config-backup"
-  New-Item -ItemType Directory -Path $backupPath -Force | Out-Null
-  Copy-Item -Path (Join-Path $Path "*") -Destination $backupPath -Recurse -Force
-  return $backupPath
-}
+function Find-Installer {
+  param([string]$SearchDir)
 
-function Restore-Config {
-  param(
-    [string]$BackupPath,
-    [string]$Path
-  )
-  if ([string]::IsNullOrWhiteSpace($BackupPath) -or -not (Test-Path $BackupPath)) {
-    return
+  $cpackInstaller = Get-ChildItem -Path (Join-Path $SearchDir "cpack_artifacts") -Recurse -File -Filter "Sunshine.exe" -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+  if ($cpackInstaller) {
+    return $cpackInstaller.FullName
   }
 
-  if (Test-Path $Path) {
-    Remove-Item -Path $Path -Recurse -Force -ErrorAction SilentlyContinue
+  $preferred = Get-ChildItem -Path $SearchDir -Recurse -File -Filter "*installer.exe" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -ne "vigembus_installer.exe" } |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+  if ($preferred) {
+    return $preferred.FullName
   }
-  New-Item -ItemType Directory -Path $Path -Force | Out-Null
-  Copy-Item -Path (Join-Path $BackupPath "*") -Destination $Path -Recurse -Force
+
+  $anyExe = Get-ChildItem -Path $SearchDir -Recurse -File -Filter "*.exe" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -like "*Sunshine*" -and $_.Name -ne "vigembus_installer.exe" } |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+  if ($anyExe) {
+    return $anyExe.FullName
+  }
+
+  throw "Could not find generated installer under $SearchDir"
 }
 
 Assert-Admin
 
-if (-not (Test-Path $RollbackInstallerPath)) {
-  throw "Rollback installer not found: $RollbackInstallerPath"
+if (-not (Test-Path $RepoDir)) {
+  throw "Repo directory not found: $RepoDir"
 }
 
-$headers = Get-GitHubHeaders -AuthToken $Token
-$workDir = New-WorkDir -Root $WorkRoot
-$artifactZip = Join-Path $workDir "artifact.zip"
-$extractDir = Join-Path $workDir "artifact"
-$installLog = Join-Path $workDir "install.log"
-$rollbackLog = Join-Path $workDir "rollback.log"
-$configBackup = $null
+if (-not (Test-Path $RollbackInstaller)) {
+  throw "Rollback installer not found: $RollbackInstaller"
+}
 
-New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
-$configBackup = Backup-Config -Path $ConfigPath -DestinationRoot $workDir
+if ([IO.Path]::GetExtension($RollbackInstaller).ToLowerInvariant() -ne ".exe") {
+  throw "Rollback installer must be an EXE installer: $RollbackInstaller"
+}
 
-$installSucceeded = $false
+Assert-Command -Name "git"
+
+$buildRoot = Join-Path $RepoDir "build"
+$deploySucceeded = $false
+$repoDirMsys = $RepoDir -replace '\\', '/'
+$repoDirMsys = $repoDirMsys -replace '^([A-Za-z]):', '/$1'
+$msysNpmCmd = (Join-Path $MsysRoot "ucrt64\bin\npm.cmd") -replace '\\', '/'
+New-Item -ItemType Directory -Path $LogRoot -Force | Out-Null
+$script:DeployLogPath = Join-Path $LogRoot ("deploy-sunshine-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
 
 try {
-  Write-Host "Validating run id $RunId..."
-  Assert-RunSucceeded -RepoName $Repo -Run $RunId -Headers $headers
+  Write-DeployLog "Updating source in $RepoDir..."
+  Set-Location $RepoDir
+  & git fetch origin
+  & git checkout $Branch
+  & git pull --ff-only origin $Branch
+  & git submodule update --init --recursive
 
-  Write-Host "Fetching artifact metadata for run $RunId..."
-  $downloadUrl = Get-ArtifactDownloadUrl -RepoName $Repo -Run $RunId -Name $ArtifactName -Headers $headers
+  if (-not (Test-Path $buildRoot)) {
+    New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
+  }
 
-  Write-Host "Downloading artifact..."
-  Download-ArtifactZip -DownloadUrl $downloadUrl -OutZip $artifactZip -Headers $headers
+  Write-DeployLog "Building and packaging in MSYS2 UCRT64..."
+  Invoke-MsysBash -MsysPath $MsysRoot -Script "export MSYSTEM=UCRT64; export CHERE_INVOKING=1; export PATH=/ucrt64/bin:/usr/bin:`$PATH; cd '$repoDirMsys' && cmake -B build -G Ninja -S . -DBUILD_DOCS=OFF -DBUILD_TESTS=OFF -DNPM=$msysNpmCmd && ninja -C build && cpack --config build/CPackConfig.cmake -G NSIS"
 
-  Write-Host "Extracting artifact..."
-  Expand-Archive -Path $artifactZip -DestinationPath $extractDir -Force
+  $newInstaller = Find-Installer -SearchDir $buildRoot
+  Write-DeployLog "Using installer: $newInstaller"
 
-  $newInstaller = Find-Installer -SearchDir $extractDir
-  Write-Host "Using installer: $newInstaller"
-
-  Write-Host "Stopping $ServiceName..."
+  Write-DeployLog "Stopping $ServiceName..."
   Stop-SunshineService -Name $ServiceName
 
-  Write-Host "Installing new build..."
-  Install-Sunshine -InstallerPath $newInstaller -LogPath $installLog
+  Write-DeployLog "Installing new build with timeout ${InstallerTimeoutSeconds}s..."
+  Install-Sunshine -InstallerPath $newInstaller -TimeoutSeconds $InstallerTimeoutSeconds
 
-  Write-Host "Starting $ServiceName..."
+  Write-DeployLog "Starting $ServiceName..."
   Start-SunshineService -Name $ServiceName
 
-  Write-Host "Waiting for readiness..."
+  Write-DeployLog "Waiting for readiness..."
   if (-not (Wait-SunshineReady -Name $ServiceName -Port $HealthPort -TimeoutSec $StartupTimeoutSeconds)) {
-    throw "Service failed readiness checks within ${StartupTimeoutSeconds}s."
+    throw "Health check failed after install."
   }
 
-  $installSucceeded = $true
-  Write-Host "Deployment successful."
+  $deploySucceeded = $true
+  Write-DeployLog "Deploy OK"
 }
 catch {
-  Write-Warning "Deployment failed: $($_.Exception.Message)"
-  Write-Warning "Rolling back with: $RollbackInstallerPath"
+  Write-DeployLog "Deploy failed: $($_.Exception.Message)"
 
-  try {
-    Stop-SunshineService -Name $ServiceName
-  } catch {
-    Write-Warning "Failed stopping service during rollback: $($_.Exception.Message)"
-  }
+  if (Test-Path $RollbackInstaller) {
+    Write-DeployLog "Rolling back with: $RollbackInstaller"
+    try {
+      Stop-SunshineService -Name $ServiceName
+    }
+    catch {
+      Write-DeployLog "Failed stopping service during rollback: $($_.Exception.Message)"
+    }
 
-  try {
-    Install-Sunshine -InstallerPath $RollbackInstallerPath -LogPath $rollbackLog
-    Restore-Config -BackupPath $configBackup -Path $ConfigPath
+    Write-DeployLog "Installing rollback build with timeout ${InstallerTimeoutSeconds}s..."
+    Install-Sunshine -InstallerPath $RollbackInstaller -TimeoutSeconds $InstallerTimeoutSeconds
+    Write-DeployLog "Starting $ServiceName after rollback..."
     Start-SunshineService -Name $ServiceName
 
     if (-not (Wait-SunshineReady -Name $ServiceName -Port $HealthPort -TimeoutSec $StartupTimeoutSeconds)) {
-      throw "Rollback install completed, but readiness checks still failed."
+      throw "Rollback completed, but health check still failed."
     }
-    Write-Warning "Rollback succeeded."
-  } catch {
-    Write-Error "Rollback failed: $($_.Exception.Message)"
-    throw
+    Write-DeployLog "Rollback succeeded."
   }
 
   throw
 }
 finally {
-  if ($installSucceeded) {
-    Write-Host "Install log: $installLog"
-  } else {
-    Write-Host "Install log: $installLog"
-    Write-Host "Rollback log: $rollbackLog"
+  Write-Host "Deploy log: $script:DeployLogPath"
+  if ($deploySucceeded) {
+    Write-Host "Deployment successful."
   }
 }
