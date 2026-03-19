@@ -37,6 +37,38 @@ function Write-DeployLog {
   Add-Content -Path $script:DeployLogPath -Value $line
 }
 
+function Get-GitHead {
+  param(
+    [string]$RepoPath,
+    [string]$Rev = "HEAD"
+  )
+
+  $output = & git -C $RepoPath rev-parse --short $Rev 2>$null
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to resolve git rev '$Rev' in $RepoPath"
+  }
+
+  return ($output | Select-Object -First 1).Trim()
+}
+
+function Write-RepoState {
+  param([string]$RepoPath)
+
+  $sunshineHead = Get-GitHead -RepoPath $RepoPath
+  Write-DeployLog "Sunshine HEAD: $sunshineHead"
+
+  $submoduleStatus = & git -C $RepoPath submodule status --recursive
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to read submodule status for $RepoPath"
+  }
+
+  foreach ($line in $submoduleStatus) {
+    if ($line -match '^\s*[-+U ]?([0-9a-f]{7,40})\s+(\S+)') {
+      Write-DeployLog "Submodule $($Matches[2]): $($Matches[1])"
+    }
+  }
+}
+
 function Get-SunshineInstallVersion {
   $paths = @(
     "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Sunshine",
@@ -242,6 +274,7 @@ try {
   & git checkout $Branch
   & git pull --ff-only origin $Branch
   & git submodule update --init --recursive
+  Write-RepoState -RepoPath $RepoDir
 
   if (-not (Test-Path $buildRoot)) {
     New-Item -ItemType Directory -Path $buildRoot -Force | Out-Null
